@@ -1,29 +1,63 @@
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-# configs
-AUUID=24b4b1e1-7a89-45f6-858c-242cf53b5bdb
-CADDYIndexPage=https://github.com/AYJCSGM/mikutap/archive/master.zip
-CONFIGCADDY=https://raw.githubusercontent.com/jth445600/HerokuXray/main/etc/Caddyfile
-CONFIGXRAY=https://raw.githubusercontent.com/jth445600/HerokuXray/master/etc/xray.json
-ParameterSSENCYPT=chacha20-ietf-poly1305
-StoreFiles=https://raw.githubusercontent.com/jth445600/HerokuXray/main/etc/StoreFiles
-#PORT=4433
-mkdir -p /etc/caddy/ /usr/share/caddy && echo -e "User-agent: *\nDisallow: /" >/usr/share/caddy/robots.txt
-wget $CADDYIndexPage -O /usr/share/caddy/index.html && unzip -qo /usr/share/caddy/index.html -d /usr/share/caddy/ && mv /usr/share/caddy/*/* /usr/share/caddy/
-wget -qO- $CONFIGCADDY | sed -e "1c :$PORT" -e "s/\$AUUID/$AUUID/g" -e "s/\$MYUUID-HASH/$(caddy hash-password --plaintext $AUUID)/g" >/etc/caddy/Caddyfile
-wget -qO- $CONFIGXRAY | sed -e "s/\$AUUID/$AUUID/g" -e "s/\$ParameterSSENCYPT/$ParameterSSENCYPT/g" >/xray.json
+PORT="${PORT:-8080}"
+XRAY_UUID="${XRAY_UUID:-}"
+XRAY_WS_PATH="${XRAY_WS_PATH:-/vless}"
+XRAY_LOGLEVEL="${XRAY_LOGLEVEL:-warning}"
 
-# storefiles
-mkdir -p /usr/share/caddy/$AUUID && wget -O /usr/share/caddy/$AUUID/StoreFiles $StoreFiles
-wget -P /usr/share/caddy/$AUUID -i /usr/share/caddy/$AUUID/StoreFiles
+if [[ -z "$XRAY_UUID" ]]; then
+  echo "[ERROR] XRAY_UUID is required"
+  exit 1
+fi
 
-for file in $(ls /usr/share/caddy/$AUUID); do
-    [[ "$file" != "StoreFiles" ]] && echo \<a href=\""$file"\" download\>$file\<\/a\>\<br\> >>/usr/share/caddy/$AUUID/ClickToDownloadStoreFiles.html
-done
+if ! echo "$XRAY_UUID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'; then
+  echo "[ERROR] XRAY_UUID is invalid: $XRAY_UUID"
+  exit 1
+fi
 
-# start
-tor &
+if [[ "${XRAY_WS_PATH}" != /* ]]; then
+  XRAY_WS_PATH="/${XRAY_WS_PATH}"
+fi
 
-/xray -config /xray.json &
+cat >/app/xray.json <<JSON
+{
+  "log": { "loglevel": "${XRAY_LOGLEVEL}" },
+  "inbounds": [
+    {
+      "tag": "vless-ws",
+      "listen": "0.0.0.0",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${XRAY_UUID}", "email": "railway@xray", "level": 0 }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": { "path": "${XRAY_WS_PATH}" }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "blocked" }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked" }
+    ]
+  }
+}
+JSON
 
-caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+xray run -test -config /app/xray.json
+exec xray run -config /app/xray.json
